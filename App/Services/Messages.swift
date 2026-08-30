@@ -56,8 +56,12 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
                 properties: [
                     "participants": .array(
                         description:
-                            "Participant handles (phone or email). Phone numbers should use E.164 format",
+                            "Participant handles (phone or email). Phone numbers should use E.164 format. Ignored when chatId is provided.",
                         items: .string()
+                    ),
+                    "chatId": .string(
+                        description:
+                            "Scope to one chat (thread), as returned by chats_fetch. When provided, participants is ignored and the fetch is not limited to messages sent by any particular handle."
                     ),
                     "start": .string(
                         description:
@@ -91,10 +95,14 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
             log.debug("Starting message fetch with arguments: \(arguments)")
             try await self.activate()
 
+            let chatId = arguments["chatId"]?.stringValue
+
             let participants =
-                arguments["participants"]?.arrayValue?.compactMap({
+                chatId == nil
+                ? arguments["participants"]?.arrayValue?.compactMap({
                     $0.stringValue
                 }) ?? []
+                : []
 
             var dateRange: Range<Date>?
             if let startDateStr = arguments["start"]?.stringValue,
@@ -130,9 +138,10 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
             let handles = try db.fetchParticipant(matching: participants)
 
             log.debug(
-                "Fetching messages with date range: \(String(describing: dateRange)), limit: \(limit ?? -1)"
+                "Fetching messages with chatId: \(chatId ?? "none"), date range: \(String(describing: dateRange)), limit: \(limit ?? -1)"
             )
             for message in try db.fetchMessages(
+                for: chatId.map { Chat.ID(rawValue: $0) },
                 with: Set(handles),
                 in: dateRange,
                 limit: max(limit ?? defaultLimit, 1024)
@@ -180,11 +189,121 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
             }
 
             log.debug("Successfully fetched \(messages.count) messages")
-            return [
-                "@context": "https://schema.org",
-                "@type": "Conversation",
-                "hasPart": Value.array(messages.map({ .object($0) })),
+            let result: [String: Value] = [
+                "@context": .string("https://schema.org"),
+                "@type": .string("Conversation"),
+                "hasPart": .array(messages.map({ .object($0) })),
             ]
+            return result
+        }
+
+        Tool(
+            name: "chats_fetch",
+            description:
+                "Find chats (threads), scoped to an exact set of participants. Returns each chat's @id, to pass as messages_fetch's chatId and scope it to one conversation instead of every chat a sender appears in",
+            inputSchema: .object(
+                properties: [
+                    "participants": .array(
+                        description:
+                            "Participant handles (phone or email) that a chat's participants must exactly match, no more and no fewer. Phone numbers should use E.164 format. If omitted, chats are not filtered by participants.",
+                        items: .string()
+                    ),
+                    "start": .string(
+                        description:
+                            "Start of the date range (inclusive) for chat activity. If timezone is omitted, local time is assumed. Date-only uses local midnight.",
+                        format: .dateTime
+                    ),
+                    "end": .string(
+                        description:
+                            "End of the date range (exclusive) for chat activity. If timezone is omitted, local time is assumed. Date-only uses local midnight.",
+                        format: .dateTime
+                    ),
+                    "limit": .integer(
+                        description: "Maximum chats to return",
+                        default: .int(defaultLimit)
+                    ),
+                ],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Fetch Chats",
+                readOnlyHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            log.debug("Starting chat fetch with arguments: \(arguments)")
+            try await self.activate()
+
+            let participants =
+                arguments["participants"]?.arrayValue?.compactMap({
+                    $0.stringValue
+                }) ?? []
+
+            var dateRange: Range<Date>?
+            if let startDateStr = arguments["start"]?.stringValue,
+                let endDateStr = arguments["end"]?.stringValue,
+                let parsedStart = ISO8601DateFormatter.parsedLenientISO8601Date(
+                    fromISO8601String: startDateStr
+                ),
+                let parsedEnd = ISO8601DateFormatter.parsedLenientISO8601Date(
+                    fromISO8601String: endDateStr
+                )
+            {
+                let calendar = Calendar.current
+                let normalizedStart = calendar.normalizedStartDate(
+                    from: parsedStart.date,
+                    isDateOnly: parsedStart.isDateOnly
+                )
+                let normalizedEnd = calendar.normalizedEndDate(
+                    from: parsedEnd.date,
+                    isDateOnly: parsedEnd.isDateOnly
+                )
+
+                dateRange = normalizedStart ..< normalizedEnd
+            }
+
+            let limit = arguments["limit"]?.intValue ?? defaultLimit
+
+            let db = try self.createDatabaseConnection()
+
+            log.debug("Fetching handles for participants: \(participants)")
+            let handles = try db.fetchParticipant(matching: participants)
+            let handleSet = Set(handles)
+
+            log.debug(
+                "Fetching chats with date range: \(String(describing: dateRange)), limit: \(limit)"
+            )
+            var chats = try db.fetchChats(
+                with: handleSet,
+                in: dateRange,
+                limit: max(limit, 1024)
+            )
+
+            // fetchChats' participant filter is a superset match (a chat with extra
+            // participants still matches), so narrow to an exact set here.
+            if !participants.isEmpty {
+                chats = chats.filter { Set($0.participants) == handleSet }
+            }
+            chats = Array(chats.prefix(limit))
+
+            log.debug("Successfully fetched \(chats.count) chats")
+            let result: Value = .array(
+                chats.map { chat -> Value in
+                    var object: [String: Value] = [
+                        "@id": .string(chat.id.rawValue),
+                        "participants": .array(chat.participants.map { .string($0.rawValue) }),
+                        "resolvedHandles": .array(handles.map { .string($0.rawValue) }),
+                    ]
+                    if let displayName = chat.displayName {
+                        object["displayName"] = .string(displayName)
+                    }
+                    if let lastMessageDate = chat.lastMessageDate {
+                        object["lastMessageDate"] = .string(lastMessageDate.formatted(.iso8601))
+                    }
+                    return .object(object)
+                }
+            )
+            return result
         }
     }
 
