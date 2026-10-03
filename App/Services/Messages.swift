@@ -111,7 +111,7 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
                     ),
                     "chatId": .string(
                         description:
-                            "Conversation @id, as reported in a message's isPartOf. Fetches only messages in that conversation"
+                            "Conversation @id, as found with chats_fetch or reported in a message's isPartOf. Fetches only messages in that conversation"
                     ),
                     "start": .string(
                         description:
@@ -163,32 +163,7 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
                 requestedChatID = Chat.ID(rawValue: string)
             }
 
-            // Either bound may be given alone; the other stays open.
-            // chat.db stores dates as Int64 nanoseconds since 2001, so the open ends
-            // use dates that fit, rather than Date.distantPast and Date.distantFuture.
-            let calendar = Calendar.current
-            func parsedDate(_ name: String) throws -> (date: Date, isDateOnly: Bool)? {
-                guard let value = arguments[name], !value.isNull else { return nil }
-                guard let string = value.stringValue else {
-                    throw ArgumentError.invalid("\(name) has the wrong type")
-                }
-                guard let parsed = ISO8601DateFormatter.parsedLenientISO8601Date(fromISO8601String: string)
-                else {
-                    throw ArgumentError.invalid("\(name) must be an ISO 8601 date")
-                }
-                return parsed
-            }
-            let start = try parsedDate("start")
-                .map { calendar.normalizedStartDate(from: $0.date, isDateOnly: $0.isDateOnly) }
-            let end = try parsedDate("end")
-                .map { calendar.normalizedEndDate(from: $0.date, isDateOnly: $0.isDateOnly) }
-            var dateRange: Range<Date>?
-            if start != nil || end != nil {
-                let lowerBound = start ?? Date(timeIntervalSinceReferenceDate: -9_000_000_000)
-                let upperBound = end ?? Date(timeIntervalSinceReferenceDate: 9_000_000_000)
-                // An end before the start matches nothing.
-                dateRange = lowerBound ..< max(lowerBound, upperBound)
-            }
+            let dateRange = try Self.dateRange(from: arguments)
 
             let searchTerm = arguments["query"]?.stringValue
             let isReadFilter = arguments["isRead"]?.boolValue
@@ -312,6 +287,162 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
                 "hasPart": Value.array(messages.map({ .object($0) })),
             ]
         }
+
+        Tool(
+            name: "chats_fetch",
+            description:
+                "Find conversations in the Messages app by participants, name or recent activity. Each result's @id is the chatId that messages_fetch accepts.",
+            inputSchema: .object(
+                properties: [
+                    "participants": .array(
+                        description:
+                            "Participant handles (phone or email) of the other people in the conversation, not including yourself. Phone numbers should use E.164 format",
+                        items: .string()
+                    ),
+                    "match": .string(
+                        description:
+                            "How participants must line up with a conversation: all (default) = it includes every one of them and may include others, exact = it includes exactly those people, any = it includes at least one of them",
+                        default: .string(ChatParticipantMatch.all.rawValue),
+                        enum: ChatParticipantMatch.allCases.map { .string($0.rawValue) }
+                    ),
+                    "query": .string(
+                        description:
+                            "Search term to filter conversations by name. Unnamed conversations never match"
+                    ),
+                    "start": .string(
+                        description:
+                            "Start of the date range (inclusive) for conversations with messages. If timezone is omitted, local time is assumed. Date-only uses local midnight.",
+                        format: .dateTime
+                    ),
+                    "end": .string(
+                        description:
+                            "End of the date range (exclusive) for conversations with messages. If timezone is omitted, local time is assumed. A date-only value includes that whole day.",
+                        format: .dateTime
+                    ),
+                    "limit": .integer(
+                        description: "Maximum conversations to return",
+                        default: .int(defaultLimit)
+                    ),
+                ],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Fetch Chats",
+                readOnlyHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            log.debug("Starting chat fetch with arguments: \(arguments)")
+            try await self.activate(offeringUpgrade: false)
+
+            let participants =
+                arguments["participants"]?.arrayValue?.compactMap({
+                    $0.stringValue
+                }) ?? []
+
+            var match = ChatParticipantMatch.all
+            if let value = arguments["match"], !value.isNull {
+                guard let string = value.stringValue else {
+                    throw ArgumentError.invalid("match has the wrong type")
+                }
+                guard let parsed = ChatParticipantMatch(rawValue: string) else {
+                    throw ArgumentError.invalid("match must be one of all, exact or any")
+                }
+                match = parsed
+            }
+
+            var searchTerm: String?
+            if let value = arguments["query"], !value.isNull {
+                guard let string = value.stringValue else {
+                    throw ArgumentError.invalid("query has the wrong type")
+                }
+                searchTerm = string
+            }
+
+            let dateRange = try Self.dateRange(from: arguments)
+            let limit = arguments["limit"]?.intValue ?? defaultLimit
+
+            let access = try self.openDatabase()
+            defer { access.stop() }
+            let db = access.database
+
+            log.debug("Fetching handles for participants: \(participants)")
+            let handles = Set(try db.fetchParticipant(matching: participants))
+            if !participants.isEmpty && handles.isEmpty {
+                return Value.array([])
+            }
+
+            var predicates: [ChatPredicate] = []
+            if !handles.isEmpty {
+                predicates.append(.participantHandles(handles, match: match == .any ? .any : .all))
+            }
+            if let dateRange {
+                predicates.append(.dateRange(dateRange))
+            }
+            let request = FetchRequest<Chat>(
+                predicate: .and(predicates),
+                limit: max(limit, 1024)
+            )
+
+            var chats: [Chat] = []
+            for chat in try db.fetch(request) {
+                guard chats.count < max(limit, 0) else { break }
+                if match == .exact, Set(chat.participants) != handles {
+                    continue
+                }
+                if let searchTerm {
+                    guard let name = chat.displayName, name.localizedCaseInsensitiveContains(searchTerm)
+                    else { continue }
+                }
+                chats.append(chat)
+            }
+
+            log.debug("Successfully fetched \(chats.count) chats")
+            return Value.array(
+                chats.map { chat in
+                    var object = Self.conversation(for: chat)
+                    if let lastMessageDate = chat.lastMessageDate {
+                        object["dateModified"] = .string(lastMessageDate.formatted(.iso8601))
+                    }
+                    return .object(object)
+                }
+            )
+        }
+    }
+
+    /// How `chats_fetch` lines up the requested participants with a conversation's own.
+    /// Madrid matches `any` and `all` in SQL; `exact` is `all` followed by a check that no one else is in the chat.
+    private enum ChatParticipantMatch: String, CaseIterable {
+        case all
+        case exact
+        case any
+    }
+
+    /// Reads the optional `start` and `end` arguments into a date range.
+    /// Either bound may be given alone; the other stays open.
+    /// chat.db stores dates as Int64 nanoseconds since 2001, so the open ends
+    /// use dates that fit, rather than Date.distantPast and Date.distantFuture.
+    private static func dateRange(from arguments: [String: Value]) throws -> Range<Date>? {
+        let calendar = Calendar.current
+        func parsedDate(_ name: String) throws -> (date: Date, isDateOnly: Bool)? {
+            guard let value = arguments[name], !value.isNull else { return nil }
+            guard let string = value.stringValue else {
+                throw ArgumentError.invalid("\(name) has the wrong type")
+            }
+            guard let parsed = ISO8601DateFormatter.parsedLenientISO8601Date(fromISO8601String: string)
+            else {
+                throw ArgumentError.invalid("\(name) must be an ISO 8601 date")
+            }
+            return parsed
+        }
+        let start = try parsedDate("start")
+            .map { calendar.normalizedStartDate(from: $0.date, isDateOnly: $0.isDateOnly) }
+        let end = try parsedDate("end")
+            .map { calendar.normalizedEndDate(from: $0.date, isDateOnly: $0.isDateOnly) }
+        guard start != nil || end != nil else { return nil }
+        let lowerBound = start ?? Date(timeIntervalSinceReferenceDate: -9_000_000_000)
+        let upperBound = end ?? Date(timeIntervalSinceReferenceDate: 9_000_000_000)
+        return lowerBound ..< max(lowerBound, upperBound)
     }
 
     /// The attachments of the given messages (by guid), keyed by message guid, in chat.db
@@ -429,14 +560,24 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
 
         let request = FetchRequest<Chat>(predicate: .id(chatID), limit: 1)
         if let chat = try db.fetch(request).first {
-            if let name = chat.displayName, !name.isEmpty {
-                conversation["name"] = .string(name)
-            }
-            conversation["participant"] = .array(
-                chat.participants.map { .object(["@id": .string($0.rawValue)]) }
-            )
+            conversation = Self.conversation(for: chat)
         }
 
+        return conversation
+    }
+
+    /// Describes an already fetched chat the same way `isPartOf` does.
+    private static func conversation(for chat: Chat) -> [String: Value] {
+        var conversation: [String: Value] = [
+            "@type": "Conversation",
+            "@id": .string(chat.id.rawValue),
+        ]
+        if let name = chat.displayName, !name.isEmpty {
+            conversation["name"] = .string(name)
+        }
+        conversation["participant"] = .array(
+            chat.participants.map { .object(["@id": .string($0.rawValue)]) }
+        )
         return conversation
     }
 
