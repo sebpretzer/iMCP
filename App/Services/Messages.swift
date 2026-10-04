@@ -111,7 +111,7 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
                     ),
                     "chatId": .string(
                         description:
-                            "Conversation @id, as reported in a message's isPartOf. Fetches only messages in that conversation"
+                            "Conversation @id, as found with chats_fetch or reported in a message's isPartOf. Fetches only messages in that conversation"
                     ),
                     "start": .string(
                         description:
@@ -287,6 +287,162 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
                 "hasPart": Value.array(messages.map({ .object($0) })),
             ]
         }
+
+        Tool(
+            name: "chats_fetch",
+            description:
+                "Find conversations in the Messages app by participants, name or activity, most recent first. Each result's @id is the chatId that messages_fetch accepts. dateModified is the latest message, within start/end when given.",
+            inputSchema: .object(
+                properties: [
+                    "participants": .array(
+                        description:
+                            "Participant handles (phone or email) of the other people in the conversation, not including yourself. Phone numbers should use E.164 format",
+                        items: .string()
+                    ),
+                    "match": .string(
+                        description:
+                            "How participants must line up with a conversation: all = it includes every one of them and may include others, exact = it includes exactly those people, any = it includes at least one of them",
+                        default: .string(ChatParticipantMatch.all.rawValue),
+                        enum: ChatParticipantMatch.allCases.map { .string($0.rawValue) }
+                    ),
+                    "query": .string(
+                        description:
+                            "Search term to filter conversations by name. Unnamed conversations never match"
+                    ),
+                    "start": .string(
+                        description:
+                            "Start of the date range (inclusive) in which a conversation has messages. If timezone is omitted, local time is assumed. Date-only uses local midnight.",
+                        format: .dateTime
+                    ),
+                    "end": .string(
+                        description:
+                            "End of the date range (exclusive) in which a conversation has messages. If timezone is omitted, local time is assumed. A date-only value includes that whole day.",
+                        format: .dateTime
+                    ),
+                    "limit": .integer(
+                        description: "Maximum conversations to return",
+                        default: .int(defaultLimit)
+                    ),
+                ],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Fetch Chats",
+                readOnlyHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            log.debug("Starting chat fetch with arguments: \(arguments)")
+            try await self.activate(offeringUpgrade: false)
+
+            let participants =
+                arguments["participants"]?.arrayValue?.compactMap({
+                    $0.stringValue
+                }) ?? []
+
+            var match = ChatParticipantMatch.all
+            if let value = arguments["match"], !value.isNull {
+                guard let string = value.stringValue else {
+                    throw ArgumentError.invalid("match has the wrong type")
+                }
+                guard let parsed = ChatParticipantMatch(rawValue: string) else {
+                    throw ArgumentError.invalid("match must be one of all, exact or any")
+                }
+                match = parsed
+            }
+
+            var searchTerm: String?
+            if let value = arguments["query"], !value.isNull {
+                guard let string = value.stringValue else {
+                    throw ArgumentError.invalid("query has the wrong type")
+                }
+                searchTerm = string
+            }
+
+            let dateRange = try Self.dateRange(from: arguments)
+            let limit = arguments["limit"]?.intValue ?? defaultLimit
+
+            let access = try self.openDatabase()
+            defer { access.stop() }
+            let db = access.database
+
+            // Each participant is resolved on its own: one handle string can match several
+            // handles (with and without a country code), all of them the same person.
+            log.debug("Fetching handles for participants: \(participants)")
+            var people = try participants.map { Set(try db.fetchParticipant(matching: [$0])) }
+            if match == .any {
+                people.removeAll { $0.isEmpty }
+            } else if people.contains(where: { $0.isEmpty }) {
+                return Value.array([])
+            }
+            if !participants.isEmpty && people.isEmpty {
+                return Value.array([])
+            }
+
+            var predicates: [ChatPredicate] = []
+            switch match {
+            case .any:
+                if !people.isEmpty {
+                    predicates.append(.participantHandles(people.reduce(into: []) { $0.formUnion($1) }, match: .any))
+                }
+            case .all, .exact:
+                predicates += people.map { .participantHandles($0, match: .any) }
+            }
+            if let dateRange {
+                predicates.append(.dateRange(dateRange))
+            }
+
+            let requiresExactParticipants = match == .exact && !people.isEmpty
+            func isIncluded(_ chat: Chat) -> Bool {
+                if requiresExactParticipants,
+                    !chat.participants.allSatisfy({ handle in people.contains { $0.contains(handle) } })
+                {
+                    return false
+                }
+                if let searchTerm {
+                    guard let name = chat.displayName, name.localizedCaseInsensitiveContains(searchTerm)
+                    else { return false }
+                }
+                return true
+            }
+
+            // exact and query are checked here rather than in SQL, so pages are read
+            // until enough chats pass or none are left.
+            let filtersFetchedChats = requiresExactParticipants || searchTerm != nil
+            var chats: [Chat] = []
+            var offset = 0
+            while chats.count < limit {
+                let pageSize = filtersFetchedChats ? 1024 : limit - chats.count
+                let page = try db.fetch(
+                    FetchRequest<Chat>(predicate: .and(predicates), limit: pageSize, offset: offset)
+                )
+                for chat in page where chats.count < limit && isIncluded(chat) {
+                    chats.append(chat)
+                }
+                guard page.count == pageSize else { break }
+                offset += pageSize
+            }
+
+            log.debug("Successfully fetched \(chats.count) chats")
+            return Value.array(
+                chats.map { chat in
+                    var object = Self.conversation(for: chat)
+                    if let lastMessageDate = chat.lastMessageDate {
+                        object["dateModified"] = .string(lastMessageDate.formatted(.iso8601))
+                    }
+                    return .object(object)
+                }
+            )
+        }
+    }
+
+    /// How `chats_fetch` lines up the requested participants with a conversation's own.
+    /// `all` and `any` are matched in SQL; `exact` is `all` followed by a check
+    /// that no one else is in the chat.
+    private enum ChatParticipantMatch: String, CaseIterable {
+        case all
+        case exact
+        case any
     }
 
     /// Reads the optional `start` and `end` arguments into a date range.
