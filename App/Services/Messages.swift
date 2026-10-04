@@ -163,32 +163,7 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
                 requestedChatID = Chat.ID(rawValue: string)
             }
 
-            // Either bound may be given alone; the other stays open.
-            // chat.db stores dates as Int64 nanoseconds since 2001, so the open ends
-            // use dates that fit, rather than Date.distantPast and Date.distantFuture.
-            let calendar = Calendar.current
-            func parsedDate(_ name: String) throws -> (date: Date, isDateOnly: Bool)? {
-                guard let value = arguments[name], !value.isNull else { return nil }
-                guard let string = value.stringValue else {
-                    throw ArgumentError.invalid("\(name) has the wrong type")
-                }
-                guard let parsed = ISO8601DateFormatter.parsedLenientISO8601Date(fromISO8601String: string)
-                else {
-                    throw ArgumentError.invalid("\(name) must be an ISO 8601 date")
-                }
-                return parsed
-            }
-            let start = try parsedDate("start")
-                .map { calendar.normalizedStartDate(from: $0.date, isDateOnly: $0.isDateOnly) }
-            let end = try parsedDate("end")
-                .map { calendar.normalizedEndDate(from: $0.date, isDateOnly: $0.isDateOnly) }
-            var dateRange: Range<Date>?
-            if start != nil || end != nil {
-                let lowerBound = start ?? Date(timeIntervalSinceReferenceDate: -9_000_000_000)
-                let upperBound = end ?? Date(timeIntervalSinceReferenceDate: 9_000_000_000)
-                // An end before the start matches nothing.
-                dateRange = lowerBound ..< max(lowerBound, upperBound)
-            }
+            let dateRange = try Self.dateRange(from: arguments)
 
             let searchTerm = arguments["query"]?.stringValue
             let isReadFilter = arguments["isRead"]?.boolValue
@@ -314,6 +289,34 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
         }
     }
 
+    /// Reads the optional `start` and `end` arguments into a date range.
+    /// Either bound may be given alone; the other stays open.
+    /// chat.db stores dates as Int64 nanoseconds since 2001, so the open ends
+    /// use dates that fit, rather than Date.distantPast and Date.distantFuture.
+    private static func dateRange(from arguments: [String: Value]) throws -> Range<Date>? {
+        let calendar = Calendar.current
+        func parsedDate(_ name: String) throws -> (date: Date, isDateOnly: Bool)? {
+            guard let value = arguments[name], !value.isNull else { return nil }
+            guard let string = value.stringValue else {
+                throw ArgumentError.invalid("\(name) has the wrong type")
+            }
+            guard let parsed = ISO8601DateFormatter.parsedLenientISO8601Date(fromISO8601String: string)
+            else {
+                throw ArgumentError.invalid("\(name) must be an ISO 8601 date")
+            }
+            return parsed
+        }
+        let start = try parsedDate("start")
+            .map { calendar.normalizedStartDate(from: $0.date, isDateOnly: $0.isDateOnly) }
+        let end = try parsedDate("end")
+            .map { calendar.normalizedEndDate(from: $0.date, isDateOnly: $0.isDateOnly) }
+        guard start != nil || end != nil else { return nil }
+        let lowerBound = start ?? Date(timeIntervalSinceReferenceDate: -9_000_000_000)
+        let upperBound = end ?? Date(timeIntervalSinceReferenceDate: 9_000_000_000)
+        // An end before the start matches nothing.
+        return lowerBound ..< max(lowerBound, upperBound)
+    }
+
     /// The attachments of the given messages (by guid), keyed by message guid, in chat.db
     /// order. Hidden attachments (Messages' own plug-in payloads) are left out.
     /// `at_<n>_<UUID>`: the attachment guid Madrid leaves in place of a placeholder.
@@ -429,14 +432,25 @@ final class MessageService: NSObject, Service, NSOpenSavePanelDelegate {
 
         let request = FetchRequest<Chat>(predicate: .id(chatID), limit: 1)
         if let chat = try db.fetch(request).first {
-            if let name = chat.displayName, !name.isEmpty {
-                conversation["name"] = .string(name)
-            }
-            conversation["participant"] = .array(
-                chat.participants.map { .object(["@id": .string($0.rawValue)]) }
-            )
+            conversation = Self.conversation(for: chat)
         }
 
+        return conversation
+    }
+
+    /// Describes an already fetched chat:
+    /// its identifier, its display name (group chats) and its participants.
+    private static func conversation(for chat: Chat) -> [String: Value] {
+        var conversation: [String: Value] = [
+            "@type": "Conversation",
+            "@id": .string(chat.id.rawValue),
+        ]
+        if let name = chat.displayName, !name.isEmpty {
+            conversation["name"] = .string(name)
+        }
+        conversation["participant"] = .array(
+            chat.participants.map { .object(["@id": .string($0.rawValue)]) }
+        )
         return conversation
     }
 
